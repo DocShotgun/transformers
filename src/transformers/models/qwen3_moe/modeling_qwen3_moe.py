@@ -45,6 +45,7 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import OutputRecorder, check_model_inputs
 from .configuration_qwen3_moe import Qwen3MoeConfig
 
+import scattermoe
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -217,8 +218,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # gating
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
+        self.moe_mlp = scattermoe.mlp.GLUMLP(
+            input_size=self.hidden_dim,
+            hidden_size=self.ffn_dim,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            activation=ACT2FN[config.hidden_act]
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -235,30 +240,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
-        # Loop over all available experts in the model and perform the computation on each expert
-        expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hitted:
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        final_hidden_states = self.moe_mlp(hidden_states, routing_weights, selected_experts)
+        final_hidden_states = final_hidden_states.view(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 
 
